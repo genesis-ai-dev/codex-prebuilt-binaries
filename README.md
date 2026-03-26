@@ -18,8 +18,32 @@ If all three tiers fail, the user sees a warning modal explaining what's missing
 | Tool | License | Upstream |
 |------|---------|----------|
 | SQLite3 (node-sqlite3) | BSD 3-Clause | [TryGhost/node-sqlite3](https://github.com/TryGhost/node-sqlite3) |
-| FFmpeg | LGPL-2.1 | [ffmpeg.org](https://ffmpeg.org) / [@ffmpeg-installer](https://www.npmjs.com/package/@ffmpeg-installer/ffmpeg) |
+| FFmpeg | **LGPL-2.1 only** | [ffmpeg.org](https://ffmpeg.org) / [@ffmpeg-installer](https://www.npmjs.com/package/@ffmpeg-installer/ffmpeg) |
 | Git | GPL-2.0 | [desktop/dugite-native](https://github.com/desktop/dugite-native) |
+
+### FFmpeg: LGPL Only — No GPL Builds
+
+FFmpeg can be compiled in two modes:
+
+- **LGPL-2.1** (default) — Safe to redistribute in proprietary applications. Includes all audio codecs Codex needs.
+- **GPL-2.0** (opt-in via `--enable-gpl`) — Unlocks extra **video** encoders (libx264, libx265, libxvid) but would require the entire host application to comply with GPL.
+
+**Codex uses LGPL builds exclusively.** Our CI pipeline verifies every FFmpeg binary by running `ffmpeg -version` (Linux) or `strings` (Windows/macOS) and **rejects** any build containing `--enable-gpl`. Upstream packages that ship GPL-compiled binaries are skipped.
+
+This is safe because Codex only uses FFmpeg for **audio** operations:
+
+| Format | Decoder | Encoder | Needs GPL? |
+|--------|---------|---------|------------|
+| WAV (PCM) | Built-in | Built-in | No |
+| MP3 | Built-in | Built-in (libshine) | No |
+| M4A / AAC | Built-in | Built-in | No |
+| OGG / Vorbis | Built-in | Built-in | No |
+| FLAC | Built-in | Built-in | No |
+| Opus | Built-in | Built-in | No |
+
+The GPL codecs (libx264, libx265, libxvid) are **video encoders** that Codex does not use. Even video *decoding* (reading H.264/H.265) works with LGPL builds — only encoding requires the GPL extras.
+
+If an upstream source only provides GPL-compiled binaries, the CI will skip that platform and log a warning. Those platforms would need an LGPL build from an alternative source or a custom compile.
 
 ## Platforms
 

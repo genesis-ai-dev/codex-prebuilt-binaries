@@ -217,6 +217,11 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
+      - name: Set up MSVC for ARM64 cross-compilation
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
       - name: Validate NPM_TOKEN
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -247,7 +252,7 @@ jobs:
           git clone --depth 1 --branch "v${VERSION}" https://github.com/TryGhost/node-sqlite3.git sqlite3-src
           cd sqlite3-src
           npm install --ignore-scripts
-          npx node-gyp rebuild --target_arch=arm64
+          npx node-gyp rebuild --target_arch=arm64 --msvs_version=2022
 
       - name: Package with LICENSE
         if: steps.check.outputs.skip != 'true'

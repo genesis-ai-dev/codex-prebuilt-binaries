@@ -72,18 +72,30 @@ jobs:
               continue
             fi
 
-            # GPL compliance check on linux binaries
+            # GPL compliance check — reject GPL-compiled binaries (Codex requires LGPL only).
+            # Linux: run ffmpeg -version. Others: check embedded strings.
+            GPL_DETECTED=false
             case "${PLATFORM}" in
               linux-*)
                 chmod +x "${FFMPEG_BIN}"
                 VERSION_OUTPUT=$("${FFMPEG_BIN}" -version 2>&1 || true)
                 if echo "${VERSION_OUTPUT}" | grep -q -- '--enable-gpl'; then
-                  echo "::error::${PLATFORM} ffmpeg binary contains --enable-gpl flag — rejecting"
-                  exit 1
+                  GPL_DETECTED=true
                 fi
-                echo "GPL check passed for ${PLATFORM}"
+                ;;
+              *)
+                if strings "${FFMPEG_BIN}" 2>/dev/null | grep -q -- '--enable-gpl'; then
+                  GPL_DETECTED=true
+                fi
                 ;;
             esac
+
+            if [ "${GPL_DETECTED}" = "true" ]; then
+              echo "::warning::${PLATFORM} ffmpeg binary contains --enable-gpl — SKIPPING (LGPL required)"
+              echo "GPL-flagged platforms need an LGPL build from an alternative source or a custom compile."
+              continue
+            fi
+            echo "GPL check passed for ${PLATFORM}"
 
             # Repackage
             mkdir -p "repackage/${PLATFORM}"
@@ -152,8 +164,9 @@ jobs:
 
           # GPL compliance check via binary strings
           if strings "${FFMPEG_BIN}" | grep -q -- '--enable-gpl'; then
-            echo "::error::win32-arm64 ffmpeg binary contains --enable-gpl — rejecting"
-            exit 1
+            echo "::warning::win32-arm64 ffmpeg binary contains --enable-gpl — SKIPPING (LGPL required)"
+            echo "This platform needs an LGPL build from an alternative source or a custom compile."
+            exit 0
           fi
           echo "GPL check passed for ${PLATFORM}"
 
