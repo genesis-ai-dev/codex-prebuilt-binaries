@@ -43,7 +43,31 @@ This is safe because Codex only uses FFmpeg for **audio** operations:
 
 The GPL codecs (libx264, libx265, libxvid) are **video encoders** that Codex does not use. Even video *decoding* (reading H.264/H.265) works with LGPL builds — only encoding requires the GPL extras.
 
-If an upstream source only provides GPL-compiled binaries, the CI will skip that platform and log a warning. Those platforms would need an LGPL build from an alternative source or a custom compile.
+If an upstream source only provides GPL-compiled binaries, the CI mirror job skips that platform with a warning. Instead, those platforms are compiled from FFmpeg source with LGPL-only flags by dedicated `build-*` jobs in the same workflow.
+
+#### From-Source Builds
+
+Three platforms ship GPL binaries upstream and are compiled from FFmpeg source (tag `n7.1` by default):
+
+| Platform | Build Method | Toolchain |
+|----------|-------------|-----------|
+| linux-x64 | Native compile on ubuntu-latest | gcc + nasm |
+| win32-x64 | Cross-compile on ubuntu-latest | mingw-w64 (`x86_64-w64-mingw32-`) |
+| win32-arm64 | Cross-compile on ubuntu-latest | llvm-mingw (`aarch64-w64-mingw32-`) from [mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw) |
+
+Configure flags used for all from-source builds:
+
+```bash
+./configure \
+  --disable-doc \
+  --disable-ffplay --disable-ffprobe \
+  --disable-network \
+  --disable-debug \
+  --enable-small \
+  --prefix="$PWD/install"
+```
+
+No `--enable-gpl`, no `--enable-nonfree`. Every compiled binary is verified with `ffmpeg -version` or `strings` to confirm no GPL flags are present.
 
 ## Platforms
 
@@ -56,10 +80,16 @@ Plus Alpine (linuxmusl-arm64, linuxmusl-x64) and win32-ia32 for SQLite3.
 
 ## Custom Builds
 
-Some platforms are not available upstream and are cross-compiled by CI:
+Some platforms are not available upstream or ship GPL-only binaries. These are built by CI:
+
+### SQLite3
 - **sqlite3-linux-arm**: Cross-compiled with `gcc-arm-linux-gnueabihf`
 - **sqlite3-win32-arm64**: Cross-compiled with MSVC ARM64
-- **ffmpeg-win32-arm64**: Sourced from community builds (LGPL verified)
+
+### FFmpeg (compiled from source — LGPL only)
+- **ffmpeg-linux-x64**: Native compile (upstream `@ffmpeg-installer/linux-x64` ships GPL)
+- **ffmpeg-win32-x64**: Cross-compiled with mingw-w64 (upstream `@ffmpeg-installer/win32-x64` ships GPL)
+- **ffmpeg-win32-arm64**: Cross-compiled with llvm-mingw (no LGPL upstream exists)
 
 ## Releases
 
@@ -197,14 +227,30 @@ Each workflow can be triggered from the [Actions tab](https://github.com/genesis
 # Mirror all SQLite3 platforms
 gh workflow run mirror-sqlite3.yml --repo genesis-ai-dev/codex-prebuilt-binaries
 
-# Mirror all FFmpeg platforms
+# Mirror all FFmpeg platforms (mirrors LGPL upstream + compiles from source for GPL platforms)
 gh workflow run mirror-ffmpeg.yml --repo genesis-ai-dev/codex-prebuilt-binaries
+# With custom FFmpeg source version:
+gh workflow run mirror-ffmpeg.yml --repo genesis-ai-dev/codex-prebuilt-binaries -f ffmpeg_source_tag=n7.1
 
 # Mirror all Git platforms
 gh workflow run mirror-git.yml --repo genesis-ai-dev/codex-prebuilt-binaries
 ```
 
 Workflows are idempotent — they skip publishing if the version already exists on npm or GitHub Releases.
+
+#### FFmpeg Workflow Structure
+
+The FFmpeg workflow has 5 jobs that run in parallel, with a final release job:
+
+```
+mirror            → mirrors LGPL upstream packages (darwin-arm64, darwin-x64, linux-arm64, linux-arm)
+build-linux-x64   → compiles FFmpeg from source (native)
+build-win32-x64   → cross-compiles FFmpeg from source (mingw-w64)
+build-win32-arm64  → cross-compiles FFmpeg from source (llvm-mingw)
+release           → collects all artifacts → GitHub Release
+```
+
+The `ffmpeg_source_tag` input controls which FFmpeg version to compile (default: `n7.1`). The mirror job always uses the upstream package versions specified in the workflow.
 
 ### Where the Code Lives (codex-editor repo)
 

@@ -7,6 +7,10 @@ on:
         description: "Version tag for the @codex-editor/ffmpeg-* packages"
         required: true
         default: "1.0.0"
+      ffmpeg_source_tag:
+        description: "FFmpeg source tag to compile (for from-source builds)"
+        required: true
+        default: "n7.1"
 
 env:
   SCOPE: "@codex-editor"
@@ -53,27 +57,22 @@ jobs:
 
             echo "=== Processing ${PLATFORM} (from ${SRC_PKG}) ==="
 
-            # Check if already published
             if npm view "${DEST_PKG}@${VERSION}" version 2>/dev/null; then
               echo "Already published ${DEST_PKG}@${VERSION} — skipping"
               continue
             fi
 
-            # Download source package tarball
             mkdir -p "work/${PLATFORM}"
             npm pack "${SRC_PKG}" --pack-destination "work/${PLATFORM}"
             TARBALL=$(ls "work/${PLATFORM}"/*.tgz)
             tar -xzf "${TARBALL}" -C "work/${PLATFORM}"
 
-            # Find the ffmpeg binary
             FFMPEG_BIN=$(find "work/${PLATFORM}/package" -type f \( -name 'ffmpeg' -o -name 'ffmpeg.exe' \) | head -1)
             if [ -z "${FFMPEG_BIN}" ]; then
               echo "::warning::Could not find ffmpeg binary in ${SRC_PKG} — skipping ${PLATFORM}"
               continue
             fi
 
-            # GPL compliance check — reject GPL-compiled binaries (Codex requires LGPL only).
-            # Linux: run ffmpeg -version. Others: check embedded strings.
             GPL_DETECTED=false
             case "${PLATFORM}" in
               linux-*)
@@ -92,19 +91,16 @@ jobs:
 
             if [ "${GPL_DETECTED}" = "true" ]; then
               echo "::warning::${PLATFORM} ffmpeg binary contains --enable-gpl — SKIPPING (LGPL required)"
-              echo "GPL-flagged platforms need an LGPL build from an alternative source or a custom compile."
               continue
             fi
             echo "GPL check passed for ${PLATFORM}"
 
-            # Repackage
             mkdir -p "repackage/${PLATFORM}"
             cp "${FFMPEG_BIN}" "repackage/${PLATFORM}/"
             cp LICENSES/ffmpeg-LGPL-2.1.txt "repackage/${PLATFORM}/LICENSE"
             tar -czf "ffmpeg-${PLATFORM}.tar.gz" -C "repackage/${PLATFORM}" .
             cp "ffmpeg-${PLATFORM}.tar.gz" release-assets/
 
-            # Publish to npm
             mkdir -p "pkg/${PLATFORM}"
             tar -xzf "ffmpeg-${PLATFORM}.tar.gz" -C "pkg/${PLATFORM}"
 
@@ -125,78 +121,336 @@ jobs:
             echo "Published ${DEST_PKG}@${VERSION}"
           done
 
-      - name: Mirror win32-arm64 from dvhh/ffmpeg-wos-arm64-build
+      - name: Upload mirrored tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-mirrored
+          path: release-assets/
+          if-no-files-found: ignore
+
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          PLATFORM="win32-arm64"
-          DEST_PKG="${SCOPE}/ffmpeg-${PLATFORM}"
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
+
+      - name: Check if already published
+        id: check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG="${SCOPE}/ffmpeg-linux-x64"
           VERSION="${{ inputs.version }}"
-
-          if npm view "${DEST_PKG}@${VERSION}" version 2>/dev/null; then
-            echo "Already published ${DEST_PKG}@${VERSION} — skipping"
-            exit 0
+          if npm view "${PKG}@${VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Package ${PKG}@${VERSION} already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "=== Processing ${PLATFORM} (from dvhh/ffmpeg-wos-arm64-build) ==="
+      - name: Install build dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm yasm pkg-config
 
-          # Download latest release from dvhh/ffmpeg-wos-arm64-build
-          mkdir -p "work/${PLATFORM}"
-          RELEASE_URL=$(curl -fsSL https://api.github.com/repos/dvhh/ffmpeg-wos-arm64-build/releases/latest \
-            | jq -r '.assets[] | select(.name | test("ffmpeg.*arm64"; "i")) | .browser_download_url' \
-            | head -1)
+      - name: Clone and build FFmpeg (LGPL only)
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          FFMPEG_TAG="${{ inputs.ffmpeg_source_tag }}"
+          git clone --depth 1 --branch "${FFMPEG_TAG}" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          ./configure \
+            --disable-doc \
+            --disable-ffplay --disable-ffprobe \
+            --disable-network \
+            --disable-debug \
+            --enable-small \
+            --prefix="$PWD/install"
+          make -j$(nproc)
+          make install
 
-          if [ -z "${RELEASE_URL}" ]; then
-            echo "::warning::Could not find win32-arm64 ffmpeg release asset"
-            exit 0
+      - name: Verify LGPL compliance
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          chmod +x ffmpeg-src/install/bin/ffmpeg
+          VERSION_OUTPUT=$(ffmpeg-src/install/bin/ffmpeg -version 2>&1 || true)
+          echo "${VERSION_OUTPUT}"
+          if echo "${VERSION_OUTPUT}" | grep -q -- '--enable-gpl'; then
+            echo "::error::Compiled ffmpeg binary contains --enable-gpl — build misconfigured"
+            exit 1
           fi
+          echo "LGPL compliance check passed"
 
-          curl -fSL -o "work/${PLATFORM}/ffmpeg-arm64.zip" "${RELEASE_URL}"
-          cd "work/${PLATFORM}"
-          unzip -o ffmpeg-arm64.zip || true
-          cd ../..
+      - name: Package with LICENSE
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          mkdir -p repackage
+          cp ffmpeg-src/install/bin/ffmpeg repackage/
+          chmod +x repackage/ffmpeg
+          cp LICENSES/ffmpeg-LGPL-2.1.txt repackage/LICENSE
+          tar -czf ffmpeg-linux-x64.tar.gz -C repackage .
 
-          FFMPEG_BIN=$(find "work/${PLATFORM}" -type f -name 'ffmpeg.exe' | head -1)
-          if [ -z "${FFMPEG_BIN}" ]; then
-            echo "::warning::Could not find ffmpeg.exe in downloaded archive"
-            exit 0
-          fi
+      - name: Publish to npm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          PKG_NAME="${SCOPE}/ffmpeg-linux-x64"
 
-          # GPL compliance check via binary strings
-          if strings "${FFMPEG_BIN}" | grep -q -- '--enable-gpl'; then
-            echo "::warning::win32-arm64 ffmpeg binary contains --enable-gpl — SKIPPING (LGPL required)"
-            echo "This platform needs an LGPL build from an alternative source or a custom compile."
-            exit 0
-          fi
-          echo "GPL check passed for ${PLATFORM}"
+          mkdir -p pkg
+          tar -xzf ffmpeg-linux-x64.tar.gz -C pkg
 
-          # Repackage
-          mkdir -p "repackage/${PLATFORM}"
-          cp "${FFMPEG_BIN}" "repackage/${PLATFORM}/"
-          cp LICENSES/ffmpeg-LGPL-2.1.txt "repackage/${PLATFORM}/LICENSE"
-          tar -czf "ffmpeg-${PLATFORM}.tar.gz" -C "repackage/${PLATFORM}" .
-          cp "ffmpeg-${PLATFORM}.tar.gz" release-assets/
-
-          # Publish to npm
-          mkdir -p "pkg/${PLATFORM}"
-          tar -xzf "ffmpeg-${PLATFORM}.tar.gz" -C "pkg/${PLATFORM}"
-
-          cat > "pkg/${PLATFORM}/package.json" <<PKGJSON
+          cat > pkg/package.json <<PKGJSON
           {
-            "name": "${DEST_PKG}",
+            "name": "${PKG_NAME}",
             "version": "${VERSION}",
-            "description": "Prebuilt ffmpeg binary for ${PLATFORM}",
+            "description": "Prebuilt LGPL ffmpeg binary for linux-x64 (compiled from source)",
             "license": "LGPL-2.1",
             "files": ["**/*"]
           }
           PKGJSON
 
-          cd "pkg/${PLATFORM}"
+          cd pkg
           npm publish --access public
-          cd ../..
 
-          echo "Published ${DEST_PKG}@${VERSION}"
+      - name: Upload tarball artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-linux-x64
+          path: ffmpeg-linux-x64.tar.gz
 
+  build-win32-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
+
+      - name: Check if already published
+        id: check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG="${SCOPE}/ffmpeg-win32-x64"
+          VERSION="${{ inputs.version }}"
+          if npm view "${PKG}@${VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Package ${PKG}@${VERSION} already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cross-compiler
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 nasm yasm
+
+      - name: Clone and cross-compile FFmpeg for win32-x64 (LGPL only)
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          FFMPEG_TAG="${{ inputs.ffmpeg_source_tag }}"
+          git clone --depth 1 --branch "${FFMPEG_TAG}" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          ./configure \
+            --arch=x86_64 \
+            --target-os=mingw32 \
+            --cross-prefix=x86_64-w64-mingw32- \
+            --disable-doc \
+            --disable-ffplay --disable-ffprobe \
+            --disable-network \
+            --disable-debug \
+            --enable-small \
+            --enable-cross-compile \
+            --prefix="$PWD/install"
+          make -j$(nproc)
+          make install
+
+      - name: Verify LGPL compliance
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          if strings ffmpeg-src/install/bin/ffmpeg.exe 2>/dev/null | grep -q -- '--enable-gpl'; then
+            echo "::error::Cross-compiled ffmpeg.exe contains --enable-gpl — build misconfigured"
+            exit 1
+          fi
+          echo "LGPL compliance check passed"
+
+      - name: Package with LICENSE
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          mkdir -p repackage
+          cp ffmpeg-src/install/bin/ffmpeg.exe repackage/
+          cp LICENSES/ffmpeg-LGPL-2.1.txt repackage/LICENSE
+          tar -czf ffmpeg-win32-x64.tar.gz -C repackage .
+
+      - name: Publish to npm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          PKG_NAME="${SCOPE}/ffmpeg-win32-x64"
+
+          mkdir -p pkg
+          tar -xzf ffmpeg-win32-x64.tar.gz -C pkg
+
+          cat > pkg/package.json <<PKGJSON
+          {
+            "name": "${PKG_NAME}",
+            "version": "${VERSION}",
+            "description": "Prebuilt LGPL ffmpeg binary for win32-x64 (cross-compiled from source)",
+            "license": "LGPL-2.1",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+          cd pkg
+          npm publish --access public
+
+      - name: Upload tarball artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-win32-x64
+          path: ffmpeg-win32-x64.tar.gz
+
+  build-win32-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
+
+      - name: Check if already published
+        id: check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG="${SCOPE}/ffmpeg-win32-arm64"
+          VERSION="${{ inputs.version }}"
+          if npm view "${PKG}@${VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Package ${PKG}@${VERSION} already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install llvm-mingw toolchain for ARM64 cross-compilation
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          LLVM_MINGW_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20250114/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64.tar.xz"
+          echo "Downloading llvm-mingw toolchain..."
+          curl -fSL -o /tmp/llvm-mingw.tar.xz "${LLVM_MINGW_URL}"
+          sudo mkdir -p /opt/llvm-mingw
+          sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+          rm /tmp/llvm-mingw.tar.xz
+          echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
+          aarch64-w64-mingw32-gcc --version
+
+      - name: Clone and cross-compile FFmpeg for win32-arm64 (LGPL only)
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          FFMPEG_TAG="${{ inputs.ffmpeg_source_tag }}"
+          git clone --depth 1 --branch "${FFMPEG_TAG}" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          ./configure \
+            --arch=aarch64 \
+            --target-os=mingw32 \
+            --cross-prefix=aarch64-w64-mingw32- \
+            --disable-doc \
+            --disable-ffplay --disable-ffprobe \
+            --disable-network \
+            --disable-debug \
+            --enable-small \
+            --enable-cross-compile \
+            --prefix="$PWD/install"
+          make -j$(nproc)
+          make install
+
+      - name: Verify LGPL compliance
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          if strings ffmpeg-src/install/bin/ffmpeg.exe 2>/dev/null | grep -q -- '--enable-gpl'; then
+            echo "::error::Cross-compiled ffmpeg.exe contains --enable-gpl — build misconfigured"
+            exit 1
+          fi
+          echo "LGPL compliance check passed"
+
+      - name: Package with LICENSE
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          mkdir -p repackage
+          cp ffmpeg-src/install/bin/ffmpeg.exe repackage/
+          cp LICENSES/ffmpeg-LGPL-2.1.txt repackage/LICENSE
+          tar -czf ffmpeg-win32-arm64.tar.gz -C repackage .
+
+      - name: Publish to npm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          PKG_NAME="${SCOPE}/ffmpeg-win32-arm64"
+
+          mkdir -p pkg
+          tar -xzf ffmpeg-win32-arm64.tar.gz -C pkg
+
+          cat > pkg/package.json <<PKGJSON
+          {
+            "name": "${PKG_NAME}",
+            "version": "${VERSION}",
+            "description": "Prebuilt LGPL ffmpeg binary for win32-arm64 (cross-compiled from source)",
+            "license": "LGPL-2.1",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+          cd pkg
+          npm publish --access public
+
+      - name: Upload tarball artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-win32-arm64
+          path: ffmpeg-win32-arm64.tar.gz
+
+  release:
+    needs: [mirror, build-linux-x64, build-win32-x64, build-win32-arm64]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
       - name: Check if release already exists
         id: check_release
         env:
@@ -209,6 +463,13 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Download all artifacts
+        if: steps.check_release.outputs.exists != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ffmpeg-*
+
       - name: Create GitHub Release
         if: steps.check_release.outputs.exists != 'true'
         env:
@@ -216,12 +477,21 @@ jobs:
         run: |
           TAG="ffmpeg-v${{ inputs.version }}"
 
+          mkdir -p release-assets
+          find artifacts -name '*.tar.gz' -exec cp {} release-assets/ \;
+
           if [ -z "$(ls -A release-assets/ 2>/dev/null)" ]; then
             echo "No assets to release"
             exit 0
           fi
 
+          echo "Release assets:"
+          ls -la release-assets/
+
           gh release create "${TAG}" release-assets/*.tar.gz \
             --repo "${{ github.repository }}" \
             --title "ffmpeg v${{ inputs.version }}" \
-            --notes "Prebuilt LGPL-compliant ffmpeg binaries for all supported platforms"
+            --notes "Prebuilt LGPL-compliant ffmpeg binaries for all supported platforms.
+          
+          Mirrored from @ffmpeg-installer (LGPL builds only).
+          Compiled from FFmpeg source ${{ inputs.ffmpeg_source_tag }} for platforms where upstream ships GPL builds."
