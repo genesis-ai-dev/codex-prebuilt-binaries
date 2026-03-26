@@ -141,7 +141,15 @@ Go to [npmjs.com/org/create](https://www.npmjs.com/org/create) and create the `c
 
 #### 3. Add `NPM_TOKEN` as a repository secret
 
-Generate a fine-grained token at [npmjs.com/settings/codex-editor/tokens](https://www.npmjs.com/settings/codex-editor/tokens) with publish access to the `@codex-editor` scope. Then:
+Generate a token at [npmjs.com/settings/codex-editor/tokens](https://www.npmjs.com/settings/codex-editor/tokens) with publish access to the `@codex-editor` scope.
+
+> **Critical: Token type matters.** The token must be one of:
+> - A **classic "Automation" token** — this bypasses 2FA entirely for CI use
+> - A **granular access token** with **"Bypass 2FA"** enabled
+>
+> A regular "Publish" classic token with 2FA enabled will fail in CI with `npm ERR! 403 Forbidden` because CI cannot complete the 2FA challenge.
+
+Then add it as a repository secret:
 
 ```bash
 gh secret set NPM_TOKEN --repo genesis-ai-dev/codex-prebuilt-binaries
@@ -149,17 +157,38 @@ gh secret set NPM_TOKEN --repo genesis-ai-dev/codex-prebuilt-binaries
 
 Paste the token when prompted. This secret is used by all three CI workflows.
 
-> **Token expiry**: If CI fails with `npm ERR! 403`, the token has expired. Generate a new one and re-run the command above.
+> **Token expiry**: If CI fails with `npm ERR! 403`, the token has likely expired. Generate a new one (same type as above) and re-run the `gh secret set` command.
 
 #### 4. Trigger initial CI mirror runs
 
+Each workflow accepts inputs with sensible defaults. Trigger with the defaults:
+
 ```bash
-gh workflow run mirror-sqlite3.yml --repo genesis-ai-dev/codex-prebuilt-binaries
-gh workflow run mirror-ffmpeg.yml --repo genesis-ai-dev/codex-prebuilt-binaries
-gh workflow run mirror-git.yml --repo genesis-ai-dev/codex-prebuilt-binaries
+gh workflow run mirror-sqlite3.yml -R genesis-ai-dev/codex-prebuilt-binaries
+gh workflow run mirror-ffmpeg.yml -R genesis-ai-dev/codex-prebuilt-binaries
+gh workflow run mirror-git.yml -R genesis-ai-dev/codex-prebuilt-binaries
 ```
 
+Or override inputs (e.g., for a new version):
+
+```bash
+gh workflow run mirror-sqlite3.yml -R genesis-ai-dev/codex-prebuilt-binaries -f version=5.1.8
+gh workflow run mirror-ffmpeg.yml -R genesis-ai-dev/codex-prebuilt-binaries -f version=1.1.0 -f ffmpeg_source_tag=n7.1
+gh workflow run mirror-git.yml -R genesis-ai-dev/codex-prebuilt-binaries -f version=2.48.0-1
+```
+
+> **Note:** Always use `-R genesis-ai-dev/codex-prebuilt-binaries` (or `--repo`) so `gh` knows which repo to target, even if you're not in a local clone.
+
 Monitor progress in the [Actions tab](https://github.com/genesis-ai-dev/codex-prebuilt-binaries/actions).
+
+### Workflow Inputs
+
+| Workflow | Input | Default | Description |
+|----------|-------|---------|-------------|
+| `mirror-sqlite3.yml` | `version` | `5.1.7` | TryGhost/node-sqlite3 version |
+| `mirror-ffmpeg.yml` | `version` | `1.0.0` | Version tag for `@codex-editor/ffmpeg-*` packages |
+| `mirror-ffmpeg.yml` | `ffmpeg_source_tag` | `n7.1` | FFmpeg source tag for from-source builds (e.g., `n7.1`, `n6.1.2`) |
+| `mirror-git.yml` | `version` | `2.47.3-1` | dugite-native release version |
 
 ### Checking for Upstream Updates
 
@@ -208,9 +237,11 @@ NPM_TOKEN=npm_abc123 GITHUB_TOKEN=ghp_def456 python3 scripts/update_binary_versi
 If the update script exits with code 3, or CI fails with `403 Forbidden`:
 
 1. Go to [npmjs.com/settings/codex-editor/tokens](https://www.npmjs.com/settings/codex-editor/tokens)
-2. Generate a new token with publish access to `@codex-editor` scope
-3. Update the repo secret: `gh secret set NPM_TOKEN --repo genesis-ai-dev/codex-prebuilt-binaries`
+2. Generate a new **"Automation" classic token** (or granular with "Bypass 2FA") with publish access to `@codex-editor` scope
+3. Update the repo secret: `gh secret set NPM_TOKEN -R genesis-ai-dev/codex-prebuilt-binaries`
 4. Re-run the failed workflow or script
+
+> A 403 does **not** always mean expiry — it can also mean the token type doesn't support headless CI (see [One-Time Setup, step 3](#3-add-npm_token-as-a-repository-secret)).
 
 #### GitHub Token
 
@@ -270,6 +301,78 @@ In the **frontier-authentication** repo:
 | File | Purpose |
 |------|---------|
 | `src/git/gitBinaryManager.ts` | Git (dugite) binary download + platform detection |
+
+### Debugging Failed Workflow Runs
+
+Monitor and debug CI failures from the command line:
+
+```bash
+# Check status of a run
+gh run view <run-id> -R genesis-ai-dev/codex-prebuilt-binaries
+
+# View logs for a specific failed job (logs only available after run completes)
+gh run view <run-id> -R genesis-ai-dev/codex-prebuilt-binaries --job <job-id> --log-failed
+
+# List recent runs for a workflow
+gh run list --workflow=mirror-ffmpeg.yml -R genesis-ai-dev/codex-prebuilt-binaries
+
+# Download artifacts from a completed run
+gh run download <run-id> -R genesis-ai-dev/codex-prebuilt-binaries --pattern 'ffmpeg-linux-x64'
+```
+
+#### Manually Uploading Assets to an Existing Release
+
+If a build job succeeds but the release job fails or a tarball is missing:
+
+```bash
+# Download artifact from the run
+gh run download <run-id> -R genesis-ai-dev/codex-prebuilt-binaries --pattern '<artifact-name>'
+
+# Upload to existing release (--clobber overwrites if already exists)
+gh release upload <tag> path/to/file.tar.gz -R genesis-ai-dev/codex-prebuilt-binaries --clobber
+```
+
+### Current Deployed Versions
+
+| Tool | Package Version | Upstream Version | FFmpeg Source | Release Tag |
+|------|----------------|-----------------|---------------|-------------|
+| SQLite3 | 5.1.7 | TryGhost/node-sqlite3 v5.1.7 (NAPI v6) | — | `sqlite3-v5.1.7` |
+| FFmpeg | 1.0.0 | @ffmpeg-installer/* v4.1.x (LGPL only) | n7.1 (from-source builds) | `ffmpeg-v1.0.0` |
+| Git | 2.47.3-1 | desktop/dugite-native v2.47.3-1 | — | `git-v2.47.3-1` |
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `npm ERR! 403 Forbidden` in CI | NPM token is expired or wrong type (needs "Automation" or granular with "Bypass 2FA") | Regenerate token, `gh secret set NPM_TOKEN -R genesis-ai-dev/codex-prebuilt-binaries` |
+| `gh run view` → "not a git repository" | Running `gh` outside a repo clone | Use `-R genesis-ai-dev/codex-prebuilt-binaries` flag |
+| SQLite3 download 404 | Upstream asset naming changed | Verify at `https://github.com/TryGhost/node-sqlite3/releases` — format is `sqlite3-v{VERSION}-napi-v{NAPI}-{PLATFORM}.tar.gz` |
+| Git download 404 | dugite-native includes commit hash in filenames | The workflow uses GitHub API + `jq` to dynamically resolve the asset URL |
+| `command not found` in same step as `GITHUB_PATH` | `GITHUB_PATH` only takes effect in subsequent steps | Use full path (e.g., `/opt/llvm-mingw/bin/...`) in the same step |
+| FFmpeg build skipped with "contains --enable-gpl" | Upstream binary ships GPL build | Expected — the `build-*` jobs compile LGPL from source for those platforms |
+| Release job says "No assets to release" | All mirror + build jobs skipped (already published) | Expected if re-running — assets exist on npm already |
+
+### Pinned Toolchain Versions
+
+These are pinned in the workflow files and should be updated periodically:
+
+| Toolchain | Version | Used For | URL |
+|-----------|---------|----------|-----|
+| llvm-mingw | 20250114 | FFmpeg win32-arm64 cross-compile | [mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) |
+| mingw-w64 | Ubuntu package | FFmpeg win32-x64 cross-compile | `apt-get install mingw-w64` |
+| node-gyp | latest (npm) | SQLite3 win32-arm64 build | `npm install -g node-gyp@latest` |
+
+### Approximate Build Times
+
+| Job | Typical Duration |
+|-----|-----------------|
+| Mirror (any tool) | 10–30 seconds |
+| FFmpeg build-linux-x64 | ~4 minutes |
+| FFmpeg build-win32-x64 | ~5.5 minutes |
+| FFmpeg build-win32-arm64 | ~5 minutes |
+| SQLite3 build-linux-arm | ~2 minutes |
+| SQLite3 build-win32-arm64 | ~3 minutes |
+| Release (collect + upload) | ~5 seconds |
 
 ### Key Rules
 
