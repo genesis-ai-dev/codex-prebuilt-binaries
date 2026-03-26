@@ -69,16 +69,25 @@ jobs:
           VERSION="${{ inputs.version }}"
           DUGITE_NAME="${{ matrix.dugite_name }}"
 
-          URL="https://github.com/nicklockwood/dugite-native/releases/download/v${VERSION}/dugite-native-v${VERSION}-${DUGITE_NAME}.tar.gz"
-          echo "Downloading ${URL}"
+          # dugite-native assets include a commit hash in the filename:
+          #   dugite-native-v2.47.3-b6d6cfa-macOS-arm64.tar.gz
+          # Use the GitHub API to find the correct .tar.gz asset for this platform.
+          RELEASE_API="https://api.github.com/repos/desktop/dugite-native/releases/tags/v${VERSION}"
+          echo "Querying release API: ${RELEASE_API}"
 
+          ASSET_URL=$(curl -fsSL "${RELEASE_API}" \
+            | jq -r --arg name "${DUGITE_NAME}" \
+              '.assets[] | select(.name | test("dugite-native-.*-" + $name + "\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+
+          if [ -z "${ASSET_URL}" ]; then
+            echo "::error::Could not find .tar.gz asset for ${DUGITE_NAME} in desktop/dugite-native v${VERSION}"
+            exit 1
+          fi
+
+          echo "Downloading ${ASSET_URL}"
           mkdir -p work
-          curl -fSL -o work/original.tar.gz "${URL}" || {
-            # Try alternate org
-            ALT_URL="https://github.com/nicklockwood/dugite-native/releases/download/v${VERSION}/git-v${VERSION}-${DUGITE_NAME}.tar.gz"
-            echo "Trying alternate URL: ${ALT_URL}"
-            curl -fSL -o work/original.tar.gz "${ALT_URL}"
-          }
+          curl -fSL -o work/original.tar.gz "${ASSET_URL}"
 
       - name: Repackage with LICENSE
         if: steps.check.outputs.skip != 'true'

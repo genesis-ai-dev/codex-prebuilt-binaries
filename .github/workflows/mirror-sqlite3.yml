@@ -63,13 +63,18 @@ jobs:
           VERSION="${{ inputs.version }}"
           PLATFORM="${{ matrix.platform }}"
 
-          # node-sqlite3 publishes prebuilt tarballs to GitHub Releases
+          # node-sqlite3 asset naming: sqlite3-v{VERSION}-napi-v{N}-{platform}.tar.gz
           NAPI_VERSION=6
-          URL="https://github.com/TryGhost/node-sqlite3/releases/download/v${VERSION}/napi-v${NAPI_VERSION}-${PLATFORM}-unknown.tar.gz"
+          URL="https://github.com/TryGhost/node-sqlite3/releases/download/v${VERSION}/sqlite3-v${VERSION}-napi-v${NAPI_VERSION}-${PLATFORM}.tar.gz"
 
           echo "Downloading ${URL}"
           mkdir -p work
-          curl -fSL -o work/original.tar.gz "${URL}"
+          curl -fSL -o work/original.tar.gz "${URL}" || {
+            # Fallback: try napi-v3
+            URL3="https://github.com/TryGhost/node-sqlite3/releases/download/v${VERSION}/sqlite3-v${VERSION}-napi-v3-${PLATFORM}.tar.gz"
+            echo "napi-v6 not found, trying napi-v3: ${URL3}"
+            curl -fSL -o work/original.tar.gz "${URL3}"
+          }
 
       - name: Repackage with LICENSE
         if: steps.check.outputs.skip != 'true'
@@ -215,9 +220,9 @@ jobs:
       - name: Validate NPM_TOKEN
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          npm whoami || echo "::error::NPM_TOKEN secret is expired or missing" && exit 1
         shell: bash
+        run: |
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
 
       - name: Check if already published
         id: check
