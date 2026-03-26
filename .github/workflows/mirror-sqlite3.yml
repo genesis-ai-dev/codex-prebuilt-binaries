@@ -217,10 +217,18 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
-      - name: Set up MSVC for ARM64 cross-compilation
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64_arm64
+      - name: Install Windows SDK and MSVC ARM64 tools
+        shell: powershell
+        run: |
+          # Install Windows 10 SDK and ARM64 build tools via VS installer
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $installPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe" modify `
+            --installPath "$installPath" `
+            --add Microsoft.VisualStudio.Component.Windows11SDK.22621 `
+            --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            --quiet --norestart --wait
+          Write-Host "Windows SDK and ARM64 tools installed"
 
       - name: Validate NPM_TOKEN
         env:
@@ -252,7 +260,9 @@ jobs:
           git clone --depth 1 --branch "v${VERSION}" https://github.com/TryGhost/node-sqlite3.git sqlite3-src
           cd sqlite3-src
           npm install --ignore-scripts
-          npx node-gyp rebuild --target_arch=arm64 --msvs_version=2022
+          # Use latest node-gyp (bundled v8.4.1 has VS detection issues)
+          npm install -g node-gyp@latest
+          node-gyp rebuild --target_arch=arm64 --msvs_version=2022
 
       - name: Package with LICENSE
         if: steps.check.outputs.skip != 'true'
