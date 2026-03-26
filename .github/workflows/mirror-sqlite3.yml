@@ -1,0 +1,331 @@
+name: Mirror SQLite3 prebuilt binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "TryGhost/node-sqlite3 version to mirror"
+        required: true
+        default: "5.1.7"
+
+env:
+  SCOPE: "@codex-editor"
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - darwin-arm64
+          - darwin-x64
+          - linux-arm64
+          - linux-x64
+          - linuxmusl-arm64
+          - linuxmusl-x64
+          - win32-ia32
+          - win32-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
+
+      - name: Check if already published
+        id: check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG="${SCOPE}/sqlite3-${{ matrix.platform }}"
+          VERSION="${{ inputs.version }}"
+          if npm view "${PKG}@${VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Package ${PKG}@${VERSION} already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download prebuilt binary
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ inputs.version }}"
+          PLATFORM="${{ matrix.platform }}"
+
+          # node-sqlite3 publishes prebuilt tarballs to GitHub Releases
+          NAPI_VERSION=6
+          URL="https://github.com/TryGhost/node-sqlite3/releases/download/v${VERSION}/napi-v${NAPI_VERSION}-${PLATFORM}-unknown.tar.gz"
+
+          echo "Downloading ${URL}"
+          mkdir -p work
+          curl -fSL -o work/original.tar.gz "${URL}"
+
+      - name: Repackage with LICENSE
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          PLATFORM="${{ matrix.platform }}"
+          mkdir -p repackage
+          tar -xzf work/original.tar.gz -C repackage
+          cp LICENSES/sqlite3-BSD-3-Clause.txt repackage/LICENSE
+          tar -czf "sqlite3-${PLATFORM}.tar.gz" -C repackage .
+
+      - name: Publish to npm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          PLATFORM="${{ matrix.platform }}"
+          PKG_NAME="${SCOPE}/sqlite3-${PLATFORM}"
+
+          mkdir -p pkg
+          tar -xzf "sqlite3-${PLATFORM}.tar.gz" -C pkg
+
+          cat > pkg/package.json <<PKGJSON
+          {
+            "name": "${PKG_NAME}",
+            "version": "${VERSION}",
+            "description": "Prebuilt sqlite3 native binary for ${PLATFORM}",
+            "license": "BSD-3-Clause",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+          cd pkg
+          npm publish --access public
+
+      - name: Upload tarball artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite3-${{ matrix.platform }}
+          path: sqlite3-${{ matrix.platform }}.tar.gz
+
+  build-linux-arm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
+
+      - name: Check if already published
+        id: check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG="${SCOPE}/sqlite3-linux-arm"
+          VERSION="${{ inputs.version }}"
+          if npm view "${PKG}@${VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Package ${PKG}@${VERSION} already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cross-compiler
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+
+      - name: Clone and build node-sqlite3 for linux-arm
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ inputs.version }}"
+          git clone --depth 1 --branch "v${VERSION}" https://github.com/TryGhost/node-sqlite3.git sqlite3-src
+          cd sqlite3-src
+          npm install --ignore-scripts
+          npx node-gyp rebuild \
+            --target_arch=arm \
+            --CC=arm-linux-gnueabihf-gcc \
+            --CXX=arm-linux-gnueabihf-g++
+        env:
+          CC: arm-linux-gnueabihf-gcc
+          CXX: arm-linux-gnueabihf-g++
+
+      - name: Package with LICENSE
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          mkdir -p repackage/Release
+          cp sqlite3-src/build/Release/node_sqlite3.node repackage/Release/
+          cp LICENSES/sqlite3-BSD-3-Clause.txt repackage/LICENSE
+          tar -czf sqlite3-linux-arm.tar.gz -C repackage .
+
+      - name: Publish to npm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          PKG_NAME="${SCOPE}/sqlite3-linux-arm"
+
+          mkdir -p pkg
+          tar -xzf sqlite3-linux-arm.tar.gz -C pkg
+
+          cat > pkg/package.json <<PKGJSON
+          {
+            "name": "${PKG_NAME}",
+            "version": "${VERSION}",
+            "description": "Prebuilt sqlite3 native binary for linux-arm",
+            "license": "BSD-3-Clause",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+          cd pkg
+          npm publish --access public
+
+      - name: Upload tarball artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite3-linux-arm
+          path: sqlite3-linux-arm.tar.gz
+
+  build-win32-arm64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami || echo "::error::NPM_TOKEN secret is expired or missing" && exit 1
+        shell: bash
+
+      - name: Check if already published
+        id: check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          PKG="${SCOPE}/sqlite3-win32-arm64"
+          VERSION="${{ inputs.version }}"
+          if npm view "${PKG}@${VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Package ${PKG}@${VERSION} already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone and build node-sqlite3 for win32-arm64
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          git clone --depth 1 --branch "v${VERSION}" https://github.com/TryGhost/node-sqlite3.git sqlite3-src
+          cd sqlite3-src
+          npm install --ignore-scripts
+          npx node-gyp rebuild --target_arch=arm64
+
+      - name: Package with LICENSE
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          mkdir -p repackage/Release
+          cp sqlite3-src/build/Release/node_sqlite3.node repackage/Release/
+          cp LICENSES/sqlite3-BSD-3-Clause.txt repackage/LICENSE
+          tar -czf sqlite3-win32-arm64.tar.gz -C repackage .
+
+      - name: Publish to npm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          PKG_NAME="${SCOPE}/sqlite3-win32-arm64"
+
+          mkdir -p pkg
+          tar -xzf sqlite3-win32-arm64.tar.gz -C pkg
+
+          cat > pkg/package.json <<PKGJSON
+          {
+            "name": "${PKG_NAME}",
+            "version": "${VERSION}",
+            "description": "Prebuilt sqlite3 native binary for win32-arm64",
+            "license": "BSD-3-Clause",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+          cd pkg
+          npm publish --access public
+
+      - name: Upload tarball artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite3-win32-arm64
+          path: sqlite3-win32-arm64.tar.gz
+
+  release:
+    needs: [mirror, build-linux-arm, build-win32-arm64]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check if release already exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="sqlite3-v${{ inputs.version }}"
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        if: steps.check_release.outputs.exists != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: sqlite3-*
+
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="sqlite3-v${{ inputs.version }}"
+
+          # Collect all tarballs from artifact subdirectories
+          mkdir -p release-assets
+          find artifacts -name '*.tar.gz' -exec cp {} release-assets/ \;
+
+          if [ -z "$(ls -A release-assets/)" ]; then
+            echo "No artifacts to release"
+            exit 0
+          fi
+
+          gh release create "${TAG}" release-assets/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "sqlite3 v${{ inputs.version }}" \
+            --notes "Prebuilt node-sqlite3 binaries mirrored from TryGhost/node-sqlite3 v${{ inputs.version }}"

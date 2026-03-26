@@ -1,0 +1,166 @@
+name: Mirror Git (dugite-native) prebuilt binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "dugite-native release version to mirror"
+        required: true
+        default: "2.47.3-1"
+
+env:
+  SCOPE: "@codex-editor"
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            dugite_name: macOS-arm64
+          - platform: darwin-x64
+            dugite_name: macOS-x64
+          - platform: linux-arm64
+            dugite_name: ubuntu-arm64
+          - platform: linux-arm
+            dugite_name: ubuntu-arm
+          - platform: linux-x64
+            dugite_name: ubuntu-x64
+          - platform: win32-arm64
+            dugite_name: windows-arm64
+          - platform: win32-x64
+            dugite_name: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
+
+      - name: Check if already published
+        id: check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG="${SCOPE}/git-${{ matrix.platform }}"
+          VERSION="${{ inputs.version }}"
+          if npm view "${PKG}@${VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Package ${PKG}@${VERSION} already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download dugite-native tarball
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ inputs.version }}"
+          DUGITE_NAME="${{ matrix.dugite_name }}"
+
+          URL="https://github.com/nicklockwood/dugite-native/releases/download/v${VERSION}/dugite-native-v${VERSION}-${DUGITE_NAME}.tar.gz"
+          echo "Downloading ${URL}"
+
+          mkdir -p work
+          curl -fSL -o work/original.tar.gz "${URL}" || {
+            # Try alternate org
+            ALT_URL="https://github.com/nicklockwood/dugite-native/releases/download/v${VERSION}/git-v${VERSION}-${DUGITE_NAME}.tar.gz"
+            echo "Trying alternate URL: ${ALT_URL}"
+            curl -fSL -o work/original.tar.gz "${ALT_URL}"
+          }
+
+      - name: Repackage with LICENSE
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          PLATFORM="${{ matrix.platform }}"
+          mkdir -p repackage
+          tar -xzf work/original.tar.gz -C repackage
+          cp LICENSES/git-GPL-2.0.txt repackage/LICENSE
+          tar -czf "git-${PLATFORM}.tar.gz" -C repackage .
+
+      - name: Publish to npm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          PLATFORM="${{ matrix.platform }}"
+          PKG_NAME="${SCOPE}/git-${PLATFORM}"
+
+          mkdir -p pkg
+          tar -xzf "git-${PLATFORM}.tar.gz" -C pkg
+
+          cat > pkg/package.json <<PKGJSON
+          {
+            "name": "${PKG_NAME}",
+            "version": "${VERSION}",
+            "description": "Prebuilt git binary for ${PLATFORM} (from dugite-native)",
+            "license": "GPL-2.0",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+          cd pkg
+          npm publish --access public
+
+      - name: Upload tarball artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-${{ matrix.platform }}
+          path: git-${{ matrix.platform }}.tar.gz
+
+  release:
+    needs: [mirror]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check if release already exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="git-v${{ inputs.version }}"
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        if: steps.check_release.outputs.exists != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: git-*
+
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="git-v${{ inputs.version }}"
+
+          mkdir -p release-assets
+          find artifacts -name '*.tar.gz' -exec cp {} release-assets/ \;
+
+          if [ -z "$(ls -A release-assets/)" ]; then
+            echo "No artifacts to release"
+            exit 0
+          fi
+
+          gh release create "${TAG}" release-assets/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "git v${{ inputs.version }}" \
+            --notes "Prebuilt git binaries mirrored from dugite-native v${{ inputs.version }}"

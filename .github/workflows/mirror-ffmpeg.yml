@@ -1,0 +1,214 @@
+name: Mirror FFmpeg prebuilt binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag for the @codex-editor/ffmpeg-* packages"
+        required: true
+        default: "1.0.0"
+
+env:
+  SCOPE: "@codex-editor"
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate NPM_TOKEN
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami || { echo "::error::NPM_TOKEN secret is expired or missing"; exit 1; }
+
+      - name: Mirror @ffmpeg-installer platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          declare -A FFMPEG_PACKAGES=(
+            ["darwin-arm64"]="@ffmpeg-installer/darwin-arm64@4.1.5"
+            ["darwin-x64"]="@ffmpeg-installer/darwin-x64@4.1.0"
+            ["linux-arm64"]="@ffmpeg-installer/linux-arm64@4.1.4"
+            ["linux-arm"]="@ffmpeg-installer/linux-arm@4.1.3"
+            ["linux-x64"]="@ffmpeg-installer/linux-x64@4.1.0"
+            ["win32-x64"]="@ffmpeg-installer/win32-x64@4.1.0"
+          )
+
+          mkdir -p release-assets
+
+          for PLATFORM in "${!FFMPEG_PACKAGES[@]}"; do
+            SRC_PKG="${FFMPEG_PACKAGES[$PLATFORM]}"
+            DEST_PKG="${SCOPE}/ffmpeg-${PLATFORM}"
+            VERSION="${{ inputs.version }}"
+
+            echo "=== Processing ${PLATFORM} (from ${SRC_PKG}) ==="
+
+            # Check if already published
+            if npm view "${DEST_PKG}@${VERSION}" version 2>/dev/null; then
+              echo "Already published ${DEST_PKG}@${VERSION} — skipping"
+              continue
+            fi
+
+            # Download source package tarball
+            mkdir -p "work/${PLATFORM}"
+            npm pack "${SRC_PKG}" --pack-destination "work/${PLATFORM}"
+            TARBALL=$(ls "work/${PLATFORM}"/*.tgz)
+            tar -xzf "${TARBALL}" -C "work/${PLATFORM}"
+
+            # Find the ffmpeg binary
+            FFMPEG_BIN=$(find "work/${PLATFORM}/package" -type f \( -name 'ffmpeg' -o -name 'ffmpeg.exe' \) | head -1)
+            if [ -z "${FFMPEG_BIN}" ]; then
+              echo "::warning::Could not find ffmpeg binary in ${SRC_PKG} — skipping ${PLATFORM}"
+              continue
+            fi
+
+            # GPL compliance check on linux binaries
+            case "${PLATFORM}" in
+              linux-*)
+                chmod +x "${FFMPEG_BIN}"
+                VERSION_OUTPUT=$("${FFMPEG_BIN}" -version 2>&1 || true)
+                if echo "${VERSION_OUTPUT}" | grep -q -- '--enable-gpl'; then
+                  echo "::error::${PLATFORM} ffmpeg binary contains --enable-gpl flag — rejecting"
+                  exit 1
+                fi
+                echo "GPL check passed for ${PLATFORM}"
+                ;;
+            esac
+
+            # Repackage
+            mkdir -p "repackage/${PLATFORM}"
+            cp "${FFMPEG_BIN}" "repackage/${PLATFORM}/"
+            cp LICENSES/ffmpeg-LGPL-2.1.txt "repackage/${PLATFORM}/LICENSE"
+            tar -czf "ffmpeg-${PLATFORM}.tar.gz" -C "repackage/${PLATFORM}" .
+            cp "ffmpeg-${PLATFORM}.tar.gz" release-assets/
+
+            # Publish to npm
+            mkdir -p "pkg/${PLATFORM}"
+            tar -xzf "ffmpeg-${PLATFORM}.tar.gz" -C "pkg/${PLATFORM}"
+
+            cat > "pkg/${PLATFORM}/package.json" <<PKGJSON
+          {
+            "name": "${DEST_PKG}",
+            "version": "${VERSION}",
+            "description": "Prebuilt ffmpeg binary for ${PLATFORM}",
+            "license": "LGPL-2.1",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+            cd "pkg/${PLATFORM}"
+            npm publish --access public
+            cd ../..
+
+            echo "Published ${DEST_PKG}@${VERSION}"
+          done
+
+      - name: Mirror win32-arm64 from dvhh/ffmpeg-wos-arm64-build
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PLATFORM="win32-arm64"
+          DEST_PKG="${SCOPE}/ffmpeg-${PLATFORM}"
+          VERSION="${{ inputs.version }}"
+
+          if npm view "${DEST_PKG}@${VERSION}" version 2>/dev/null; then
+            echo "Already published ${DEST_PKG}@${VERSION} — skipping"
+            exit 0
+          fi
+
+          echo "=== Processing ${PLATFORM} (from dvhh/ffmpeg-wos-arm64-build) ==="
+
+          # Download latest release from dvhh/ffmpeg-wos-arm64-build
+          mkdir -p "work/${PLATFORM}"
+          RELEASE_URL=$(curl -fsSL https://api.github.com/repos/dvhh/ffmpeg-wos-arm64-build/releases/latest \
+            | jq -r '.assets[] | select(.name | test("ffmpeg.*arm64"; "i")) | .browser_download_url' \
+            | head -1)
+
+          if [ -z "${RELEASE_URL}" ]; then
+            echo "::warning::Could not find win32-arm64 ffmpeg release asset"
+            exit 0
+          fi
+
+          curl -fSL -o "work/${PLATFORM}/ffmpeg-arm64.zip" "${RELEASE_URL}"
+          cd "work/${PLATFORM}"
+          unzip -o ffmpeg-arm64.zip || true
+          cd ../..
+
+          FFMPEG_BIN=$(find "work/${PLATFORM}" -type f -name 'ffmpeg.exe' | head -1)
+          if [ -z "${FFMPEG_BIN}" ]; then
+            echo "::warning::Could not find ffmpeg.exe in downloaded archive"
+            exit 0
+          fi
+
+          # GPL compliance check via binary strings
+          if strings "${FFMPEG_BIN}" | grep -q -- '--enable-gpl'; then
+            echo "::error::win32-arm64 ffmpeg binary contains --enable-gpl — rejecting"
+            exit 1
+          fi
+          echo "GPL check passed for ${PLATFORM}"
+
+          # Repackage
+          mkdir -p "repackage/${PLATFORM}"
+          cp "${FFMPEG_BIN}" "repackage/${PLATFORM}/"
+          cp LICENSES/ffmpeg-LGPL-2.1.txt "repackage/${PLATFORM}/LICENSE"
+          tar -czf "ffmpeg-${PLATFORM}.tar.gz" -C "repackage/${PLATFORM}" .
+          cp "ffmpeg-${PLATFORM}.tar.gz" release-assets/
+
+          # Publish to npm
+          mkdir -p "pkg/${PLATFORM}"
+          tar -xzf "ffmpeg-${PLATFORM}.tar.gz" -C "pkg/${PLATFORM}"
+
+          cat > "pkg/${PLATFORM}/package.json" <<PKGJSON
+          {
+            "name": "${DEST_PKG}",
+            "version": "${VERSION}",
+            "description": "Prebuilt ffmpeg binary for ${PLATFORM}",
+            "license": "LGPL-2.1",
+            "files": ["**/*"]
+          }
+          PKGJSON
+
+          cd "pkg/${PLATFORM}"
+          npm publish --access public
+          cd ../..
+
+          echo "Published ${DEST_PKG}@${VERSION}"
+
+      - name: Check if release already exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ffmpeg-v${{ inputs.version }}"
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ffmpeg-v${{ inputs.version }}"
+
+          if [ -z "$(ls -A release-assets/ 2>/dev/null)" ]; then
+            echo "No assets to release"
+            exit 0
+          fi
+
+          gh release create "${TAG}" release-assets/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "ffmpeg v${{ inputs.version }}" \
+            --notes "Prebuilt LGPL-compliant ffmpeg binaries for all supported platforms"
