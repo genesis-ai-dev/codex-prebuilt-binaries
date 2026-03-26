@@ -376,7 +376,8 @@ jobs:
           sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
           rm /tmp/llvm-mingw.tar.xz
           echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
-          aarch64-w64-mingw32-gcc --version
+          # GITHUB_PATH takes effect in subsequent steps; verify with full path
+          /opt/llvm-mingw/bin/aarch64-w64-mingw32-gcc --version
 
       - name: Clone and cross-compile FFmpeg for win32-arm64 (LGPL only)
         if: steps.check.outputs.skip != 'true'
@@ -451,34 +452,21 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Check if release already exists
-        id: check_release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="ffmpeg-v${{ inputs.version }}"
-          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download all artifacts
-        if: steps.check_release.outputs.exists != 'true'
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: ffmpeg-*
+          merge-multiple: false
 
-      - name: Create GitHub Release
-        if: steps.check_release.outputs.exists != 'true'
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="ffmpeg-v${{ inputs.version }}"
 
           mkdir -p release-assets
-          find artifacts -name '*.tar.gz' -exec cp {} release-assets/ \;
+          find artifacts -name '*.tar.gz' -exec cp {} release-assets/ \; 2>/dev/null || true
 
           if [ -z "$(ls -A release-assets/ 2>/dev/null)" ]; then
             echo "No assets to release"
@@ -488,10 +476,17 @@ jobs:
           echo "Release assets:"
           ls -la release-assets/
 
-          gh release create "${TAG}" release-assets/*.tar.gz \
-            --repo "${{ github.repository }}" \
-            --title "ffmpeg v${{ inputs.version }}" \
-            --notes "Prebuilt LGPL-compliant ffmpeg binaries for all supported platforms.
-          
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — uploading new assets"
+            gh release upload "${TAG}" release-assets/*.tar.gz \
+              --repo "${{ github.repository }}" \
+              --clobber
+          else
+            gh release create "${TAG}" release-assets/*.tar.gz \
+              --repo "${{ github.repository }}" \
+              --title "ffmpeg v${{ inputs.version }}" \
+              --notes "Prebuilt LGPL-compliant ffmpeg binaries for all supported platforms.
+
           Mirrored from @ffmpeg-installer (LGPL builds only).
           Compiled from FFmpeg source ${{ inputs.ffmpeg_source_tag }} for platforms where upstream ships GPL builds."
+          fi
